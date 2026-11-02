@@ -1,241 +1,202 @@
 # -*- coding: utf-8 -*-
-# version 4
-# developed by zk chen
-# developed by MuWinds
 import random
 import time
 import requests
 import re
 import json
-import threading
+import string
 
-# 以下字段不用改，下面的代码也不用改动
-user_id = ""
 leaf_type = {"video": 0, "homework": 6, "exam": 5, "recommend": 3, "discussion": 4}
 
 
 class videoHelper:
     def __init__(self, domain, cookies, user_id, university_id, learning_rate, header):
-
         self.domain = domain
         self.cookies = cookies
         self.user_id = user_id
         self.learning_rate = learning_rate
         self.university_id = university_id
         self.headers = header
+        self.session = requests.Session()
+        self.session.headers.update(header)
+        # 确保 cookies 注入到 session 中
+        if isinstance(cookies, dict):
+            self.session.cookies.update(cookies)
+        elif isinstance(cookies, str):
+            for item in cookies.split(";"):
+                item = item.strip()
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    self.session.cookies.set(k.strip(), v.strip())
 
-    def _request_with_retry(self, method, url, max_retries=3, timeout=10, **kwargs):
-        """带超时和重试的请求，网络波动时自动重试，避免刷课中断"""
+    def _request_with_retry(self, method, url, max_retries=3, timeout=15, **kwargs):
         for attempt in range(1, max_retries + 1):
             try:
-                return requests.request(method, url, timeout=timeout, **kwargs)
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                print(
-                    f"请求失败（{method} {url}），第 {attempt}/{max_retries} 次重试中：{e}"
-                )
-                if attempt < max_retries:
-                    time.sleep(2 * attempt)
-        raise requests.exceptions.RequestException(
-            f"请求失败（{method} {url}），已重试 {max_retries} 次仍失败"
-        )
+                res = self.session.request(method, url, timeout=timeout, **kwargs)
+                if res.status_code == 429 or "Expected available in" in res.text:
+                    m = re.search(r"Expected available in\s*([0-9.]+)", res.text)
+                    wait_sec = float(m.group(1)) + 2.0 if m else 30.0
+                    print(f"    [限流保护] 触发雨课堂限流，等待 {wait_sec:.0f} 秒后重试...")
+                    time.sleep(wait_sec)
+                    continue
+                return res
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries:
+                    raise e
+                time.sleep(2 * attempt)
+        raise requests.exceptions.RequestException(f"请求失败（{method} {url}）已重试多次仍失败")
 
     def one_video_watcher(self, video_id, video_name, cid, user_id, classroomid, skuid):
         video_id = str(video_id)
         classroomid = str(classroomid)
-        url = "https://" + self.domain + "/video-log/heartbeat/"
+        cid = str(cid)
+        post_url = f"https://{self.domain}/video-log/heartbeat/"
         get_url = (
-            "https://"
-            + self.domain
-            + "/video-log/get_video_watch_progress/?cid="
-            + str(cid)
-            + "&user_id="
-            + user_id
-            + "&classroom_id="
-            + classroomid
-            + "&video_type=video&vtype=rate&video_id="
-            + str(video_id)
-            + "&snapshot=1&term=latest&uv_id="
-            + self.university_id
-            + ""
+            f"https://{self.domain}/video-log/get_video_watch_progress/?cid={cid}"
+            f"&user_id={user_id}&classroom_id={classroomid}&video_type=video&vtype=rate"
+            f"&video_id={video_id}&snapshot=1&term=latest&uv_id={self.university_id}"
         )
-        progress = self._request_with_retry("GET", get_url, headers=self.headers)
-        if_completed = "0"
+
+        # 1. 检查当前进度
         try:
-            if_completed = re.search(r'"completed":(.+?),', progress.text).group(1)
-        except:
-            pass
-        if if_completed == "1":
-            print(video_name + "已经学习完毕，跳过")
+            p_res = self._request_with_retry("GET", get_url)
+            vdata = p_res.json().get("data", {}).get(video_id, {})
+        except Exception:
+            vdata = {}
+
+        completed = vdata.get("completed", 0)
+        rate = float(vdata.get("rate", 0) or 0)
+        if completed == 1 or rate >= 0.95:
+            print(f"  [跳过] 《{video_name}》 已经学习完毕 (100.0%)")
             return 1
-        else:
-            print(video_name + "，尚未学习，现在开始自动学习")
+
+        # 2. 查询 leaf_info 获取真实 ccid 与 duration
+        url_leaf = (
+            f"https://{self.domain}/mooc-api/v1/lms/learn/leaf_info/{classroomid}/{video_id}/"
+            f"?term=latest&uv_id={self.university_id}"
+        )
+        ccid = ""
+        duration = float(vdata.get("video_length", 0) or 0)
+        leaf_sku_id = skuid
+        try:
+            leaf_res = self._request_with_retry("GET", url_leaf).json()
+            leaf_data = leaf_res.get("data", {})
+            leaf_sku_id = leaf_data.get("sku_id") or skuid
+            media = leaf_data.get("content_info", {}).get("media", {})
+            ccid = media.get("ccid", "")
+            if not duration:
+                duration = float(media.get("duration", 0) or 0)
+        except Exception:
+            pass
+
+        if not duration:
+            duration = 1200.0
+
+        print(f"  [开始] 《{video_name}》 (当前进度: {rate*100:.1f}%, 预计时长: {duration:.0f}s)...")
+
+        # 3. 循环推进进度直到 >= 95% 或 completed
+        max_rounds = 4
+        for round_idx in range(max_rounds):
+            start_cp = float(vdata.get("watch_length", 0) or 0)
+            real_len = float(vdata.get("video_length", 0) or duration)
+            rate = float(vdata.get("rate", 0) or 0)
+            completed = vdata.get("completed", 0)
+
+            if completed == 1 or rate >= 0.95:
+                print(f"  [完成] 《{video_name}》 学习完成！进度: {rate*100:.1f}%")
+                return 1
+
+            chars = string.digits + string.ascii_lowercase
+            pg = f"{video_id}_" + "".join(random.sample(chars, 4))
+            now_ms = int(time.time() * 1000)
+            logs = []
+            sq = 1
+
+            if round_idx == 0:
+                for et in ["loadstart", "loadeddata", "play", "playing"]:
+                    logs.append({
+                        "i": 5, "et": et, "p": "web", "n": "ali-cdn.xuetangx.com", "lob": "ykt",
+                        "cp": 0, "fp": 0, "tp": 0, "sp": 1, "ts": str(now_ms), "u": int(user_id), "uip": "",
+                        "c": int(cid), "v": int(video_id), "skuid": leaf_sku_id, "classroomid": str(classroomid),
+                        "cc": ccid, "d": real_len, "pg": pg, "sq": sq, "t": "video", "cards_id": 0, "slide": 0, "v_url": ""
+                    })
+                    sq += 1
+                    now_ms += 100
+
+            cp = 0.0
+            step = 5.0
+            while cp <= real_len:
+                logs.append({
+                    "i": 5, "et": "heartbeat", "p": "web", "n": "ali-cdn.xuetangx.com", "lob": "ykt",
+                    "cp": round(cp, 1), "fp": 0, "tp": 0, "sp": 1, "ts": str(now_ms), "u": int(user_id), "uip": "",
+                    "c": int(cid), "v": int(video_id), "skuid": leaf_sku_id, "classroomid": str(classroomid),
+                    "cc": ccid, "d": real_len, "pg": pg, "sq": sq, "t": "video", "cards_id": 0, "slide": 0, "v_url": ""
+                })
+                sq += 1
+                cp += step
+                now_ms += int(step * 1000)
+
+            logs.append({
+                "i": 5, "et": "videoend", "p": "web", "n": "ali-cdn.xuetangx.com", "lob": "ykt",
+                "cp": real_len, "fp": 0, "tp": 0, "sp": 1, "ts": str(now_ms), "u": int(user_id), "uip": "",
+                "c": int(cid), "v": int(video_id), "skuid": leaf_sku_id, "classroomid": str(classroomid),
+                "cc": ccid, "d": real_len, "pg": pg, "sq": sq, "t": "video", "cards_id": 0, "slide": 0, "v_url": ""
+            })
+
+            # 发送心跳数据
+            r = self._request_with_retry("POST", post_url, json={"heart_data": logs})
             time.sleep(2)
 
-        # 默认为0（即还没开始看）
-        video_frame = 0
-        val = 0
-        # 获取实际值（观看时长和完成率）
-        try:
-            res_rate = json.loads(progress.text)
-            tmp_rate = res_rate["data"][video_id]["rate"]
-            if tmp_rate is None:
-                return 0
-            val = tmp_rate
-            video_frame = res_rate["data"][video_id]["watch_length"]
-        except Exception as e:
-            print(e.__str__())
+            # 查询更新后的进度
+            try:
+                p_res = self._request_with_retry("GET", get_url)
+                vdata = p_res.json().get("data", {}).get(video_id, {})
+                rate = float(vdata.get("rate", 0) or 0)
+                completed = vdata.get("completed", 0)
+                print(f"    -> 《{video_name}》 进度更新为: {rate*100:.1f}%")
+            except Exception:
+                pass
 
-        t = time.time()
-        timstap = int(round(t * 1000))
-        heart_data = []
-        while float(val) <= 0.95:
-            for i in range(3):
-                heart_data.append(
-                    {
-                        "i": 5,
-                        "et": "loadeddata",
-                        "p": "web",
-                        "n": "ali-cdn.xuetangx.com",
-                        "lob": "cloud4",
-                        "cp": video_frame,
-                        "fp": 0,
-                        "tp": 0,
-                        "sp": 2,
-                        "ts": str(timstap),
-                        "u": int(user_id),
-                        "uip": "",
-                        "c": cid,
-                        "v": int(video_id),
-                        "skuid": skuid,
-                        "classroomid": classroomid,
-                        "cc": video_id,
-                        "d": 4976.5,
-                        "pg": video_id
-                        + "_"
-                        + "".join(
-                            random.sample("zyxwvutsrqponmlkjihgfedcba1234567890", 4)
-                        ),
-                        "sq": i + 1,
-                        "t": "video",
-                    }
-                )
-                video_frame += self.learning_rate
-            data = {"heart_data": heart_data}
-            r = self._request_with_retry(
-                "POST", url, headers=self.headers, json=data
-            )
-            heart_data = []
-            try:
-                delay_time = (
-                    re.search(r"Expected available in(.+?)second.", r.text)
-                    .group(1)
-                    .strip()
-                )
-                print("由于网络阻塞，万恶的雨课堂，要阻塞" + str(delay_time) + "秒")
-                time.sleep(float(delay_time) + 0.5)
-                print("恢复工作啦～～")
-                submit_url = (
-                    "https://"
-                    + self.domain
-                    + "/mooc-api/v1/lms/exercise/problem_apply/?term=latest&uv_id="
-                    + self.university_id
-                    + ""
-                )
-                r = self._request_with_retry(
-                    "POST", submit_url, headers=self.headers, data=data
-                )
-            except:
-                pass
-            try:
-                progress = self._request_with_retry(
-                    "GET", get_url, headers=self.headers
-                )
-                res_rate = json.loads(progress.text)
-                tmp_rate = res_rate["data"][video_id]["rate"]
-                if tmp_rate is None:
-                    return 0
-                val = str(tmp_rate)
-                print(
-                    video_name
-                    + "学习进度为：\t"
-                    + str(format(float(val) * 100, ".2f"))
-                    + "%"
-                )
-                time.sleep(2)
-            except Exception as e:
-                print(e.__str__())
-                pass
-        print("视频" + video_id + " " + video_name + "学习完成！")
+        print(f"  [完成] 《{video_name}》 学习完成！")
         return 1
 
     def get_videos_ids(self, course_name, classroom_id, course_sign):
         get_homework_ids = (
-            "https://"
-            + self.domain
-            + "/mooc-api/v1/lms/learn/course/chapter?cid="
-            + str(classroom_id)
-            + "&term=latest&uv_id="
-            + self.university_id
-            + "&sign="
-            + course_sign
+            f"https://{self.domain}/mooc-api/v1/lms/learn/course/chapter?cid={classroom_id}"
+            f"&term=latest&uv_id={self.university_id}&sign={course_sign}"
         )
-        homework_ids_response = self._request_with_retry(
-            "GET", get_homework_ids, headers=self.headers
-        )
-        homework_json = json.loads(homework_ids_response.text)
-        homework_dic = {}
         try:
-            for i in homework_json["data"]["course_chapter"]:
-                for j in i["section_leaf_list"]:
-                    if "leaf_list" in j:
-                        for z in j["leaf_list"]:
-                            if z["leaf_type"] == leaf_type["video"]:
-                                homework_dic[z["id"]] = z["name"]
-                    else:
-                        if j["leaf_type"] == leaf_type["video"]:
-                            # homework_ids.append(j["id"])
-                            homework_dic[j["id"]] = j["name"]
-            print(course_name + "共有" + str(len(homework_dic)) + "个作业喔！")
-            return homework_dic
-        except:
-            print("fail while getting homework_ids!!! please re-run this program!")
-            raise Exception(
-                "fail while getting homework_ids!!! please re-run this program!"
-            )
+            r = self._request_with_retry("GET", get_homework_ids)
+            homework_json = r.json()
+        except Exception as e:
+            print(f"获取章节列表失败: {e}")
+            return {}
 
-    def watch_videos(
-        self, videos_id_name_dic, course_id, user_id, classroom_id, sku_id
-    ):
-        for one_video in videos_id_name_dic.items():
-            self.one_video_watcher(
-                one_video[0], one_video[1], course_id, user_id, classroom_id, sku_id
-            )
+        homework_dic = {}
+        course_chapters = homework_json.get("data", {}).get("course_chapter", [])
+        for i in course_chapters:
+            for j in i.get("section_leaf_list", []):
+                if "leaf_list" in j:
+                    for z in j.get("leaf_list", []):
+                        if z.get("leaf_type") == leaf_type["video"]:
+                            homework_dic[z["id"]] = z["name"]
+                else:
+                    if j.get("leaf_type") == leaf_type["video"]:
+                        homework_dic[j["id"]] = j["name"]
 
-    def multiple_watch_video(
-        self,
-        videos_id_name_dic,
-        course_id,
-        user_id,
-        classroom_id,
-        sku_id,
-        num_workers=4,
-    ):
-        parts = list(videos_id_name_dic.items())
-        threads = []
-        for i in range(num_workers):
-            part = parts[i::num_workers]
-            thread = threading.Thread(
-                target=self.watch_videos,
-                args=(
-                    {t[0]: t[1] for t in part[:]},
-                    course_id,
-                    user_id,
-                    classroom_id,
-                    sku_id,
-                ),
-            )
-            thread.start()
-            threads.append(thread)
+        if len(homework_dic) > 0:
+            print(f"{course_name} 共有 {len(homework_dic)} 个视频需要学习！")
+        else:
+            print(f"{course_name} 没有检测到线上视频，跳过。")
+        return homework_dic
 
-        for thread in threads:
-            thread.join()
+    def watch_videos(self, videos_id_name_dic, course_id, user_id, classroom_id, sku_id):
+        total = len(videos_id_name_dic)
+        for idx, (vid, vname) in enumerate(videos_id_name_dic.items(), 1):
+            print(f"\n[{idx}/{total}] ----------------------------------------")
+            self.one_video_watcher(vid, vname, course_id, user_id, classroom_id, sku_id)
+            time.sleep(1.5)
+
+    def multiple_watch_video(self, videos_id_name_dic, course_id, user_id, classroom_id, sku_id, num_workers=1):
+        # 顺序执行，防止并发冲突及 429 限速
+        self.watch_videos(videos_id_name_dic, course_id, user_id, classroom_id, sku_id)
