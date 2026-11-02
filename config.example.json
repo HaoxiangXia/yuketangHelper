@@ -1,0 +1,12 @@
+{
+  "domain": "buu.yuketang.cn",
+  "use_cached_cookies": true,
+  "cookie_file": "cookie.txt",
+  "course_number": null,
+  "do_homework": false,
+  "learning_rate": 12,
+  "base_url": "https://api.openai.com/v1",
+  "key": "",
+  "model": "gpt-3.5-turbo",
+  "system_prompt": "回答下面的问题,如果是填空题则按照下面的json格式返回答案，比如有2个空，则第一个空键为1，值为第一个空的答案，第二个空键为2，值为第二个空的答案。如果是选择题直接返回答案对应选项的字母,不要回复多余内容,如果不知道答案,请直接回答C,多选题回答格式是每个选项之间用一个半角逗号和一个空格分开，判断题只用返回true或false，不用回复标点符号。"
+}
