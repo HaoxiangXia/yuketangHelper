@@ -152,13 +152,21 @@ def main():
         c_res = requests.get(c_url, headers=headers).json()
         if c_res.get("errcode") == 0 and c_res.get("data", {}).get("list"):
             for item in c_res["data"]["list"]:
+                raw_class_name = item.get("name", "")
+                raw_course_name = item.get("course", {}).get("name", "")
+                if raw_course_name and raw_course_name not in raw_class_name:
+                    display_name = f"{raw_course_name} ({raw_class_name})"
+                else:
+                    display_name = raw_class_name or raw_course_name
+
                 courses.append({
-                    "course_name": item["name"],
+                    "course_name": display_name,
                     "classroom_id": item["classroom_id"],
                     "course_sign": item.get("course_sign", ""),
                     "sku_id": item.get("sku_id", 0),
                     "course_id": item.get("course", {}).get("id") or item.get("course_id", 0),
                     "university_id": str(item.get("course", {}).get("university_id") or university_id),
+                    "teacher_name": item.get("teacher", {}).get("name", ""),
                 })
     except Exception:
         pass
